@@ -5,6 +5,11 @@
  * 1) 在工具调用完成后，将支付和合规信息异步写入 Dashboard。
  * 2) 提供结构化的载荷组装函数，将分散的上下文统一映射为 API 请求体。
  * 3) 采用 fire-and-forget 模式，不阻塞主链路响应。
+ *
+ * v2.0 变更：移除 KYT 相关字段（payerKytResult/payeeKytResult/payerKytRiskLevel/payeeKytRiskLevel）。
+ *
+ * @author kuangyp
+ * @version 2026-04-02
  */
 
 import type { ComplianceDecision, PayeeComplianceDecision } from "./compliance.js";
@@ -21,7 +26,6 @@ import type { ComplianceDecision, PayeeComplianceDecision } from "./compliance.j
 export interface TransactionConfig {
   baseUrl: string;      // Dashboard 域名（如 https://your-domain.com）
   apiKey: string;       // API Key
-  defaultChain: string; // 默认链标识（当支付上下文缺失时使用）
 }
 
 // =====================================================================
@@ -31,8 +35,8 @@ export interface TransactionConfig {
 /**
  * 支付上下文信息。
  *
- * 在 onPaymentRequested 回调中从下游挑战里提取，
- * 缓存后在 call_service_tool 响应中透传给上游 Agent，
+ * 从支付挑战（PaymentRequired）中提取，
+ * 在 call_service_tool 响应中透传给上游 Agent，
  * 同时作为交易记录的数据源。
  */
 export interface PaymentContext {
@@ -43,9 +47,9 @@ export interface PaymentContext {
 }
 
 /**
- * 链上支付回执结构（从 result.paymentResponse 中提取）。
+ * 链上支付回执结构（从二次调用结果的 _meta["x402/payment-response"] 中提取）。
  *
- * 字段来源于 x402 SDK 的支付完成回调：
+ * 字段含义：
  * - success: 支付链上是否确认成功。
  * - transaction: 链上交易哈希（txHash）。
  * - network: 支付所在链（如 eip155:84532）。
@@ -77,29 +81,13 @@ export interface TransactionRecordPayload {
   payer?: string;
   payee?: string;
   payerKycResult?: number;
-  payerKytResult?: number;
-  payerKytRiskLevel?: number;
   payeeKycResult?: number;
-  payeeKytResult?: number;
-  payeeKytRiskLevel?: number;
   createdAt?: string;  // 客户端生成的中国时区时间戳，精确到秒
 }
 
 // =====================================================================
 // 内部映射函数
 // =====================================================================
-
-/**
- * 将风险等级字符串映射为数字编码。
- *
- * 对应关系（与 Dashboard API 约定一致）：
- * - low → 0、moderate → 1、high → 2、severe → 3
- * - 未知 → undefined（不写入）
- */
-function mapRiskLevelToNumber(riskLevel?: string): number | undefined {
-  const mapping: Record<string, number> = { low: 0, moderate: 1, high: 2, severe: 3 };
-  return riskLevel ? mapping[riskLevel] : undefined;
-}
 
 /**
  * 将 KYC 结果映射为数字：approved → 1，其余 → 0。
@@ -111,16 +99,6 @@ function mapKycToNumber(kycCompleted?: boolean, kycStatus?: string | null): numb
   return kycCompleted === true && kycStatus === "approved" ? 1 : 0;
 }
 
-/**
- * 将 KYT 决策映射为数字：pass → 1，其余 → 0。
- */
-function mapKytDecisionToNumber(decision?: string): number | undefined {
-  if (!decision) {
-    return undefined;
-  }
-  return decision === "pass" ? 1 : 0;
-}
-
 // =====================================================================
 // 导出函数
 // =====================================================================
@@ -128,10 +106,10 @@ function mapKytDecisionToNumber(decision?: string): number | undefined {
 /**
  * 安全地从 paymentResponse 中提取结构化数据。
  *
- * paymentResponse 在 MCP SDK 中类型为 unknown，
+ * paymentResponse 来自二次调用结果的 _meta["x402/payment-response"]，类型为 unknown。
  * 此函数做防御性解析，确保即使结构变化也不会抛错。
  *
- * @param raw result.paymentResponse 原始值。
+ * @param raw paymentResponse 原始值。
  * @returns 结构化支付回执，或 null。
  */
 export function extractPaymentResponseData(raw: unknown): PaymentResponseData | null {
@@ -153,7 +131,7 @@ export function extractPaymentResponseData(raw: unknown): PaymentResponseData | 
  * 从工具调用的各个上下文中提取字段，映射为 Dashboard API 要求的格式。
  * 对于缺失的可选字段，不写入（undefined 在 JSON.stringify 时自动忽略）。
  *
- * @param config 交易记录服务配置（提供 defaultChain 兜底）。
+ * @param config 交易记录服务配置。
  * @param params 组装所需的所有上下文数据。
  * @returns 可直接 POST 到 /api/transactions 的请求体。
  */
@@ -175,7 +153,7 @@ export function buildTransactionPayload(
   return {
     serviceName: toolName,
     serviceResult,
-    chain: paymentCtx?.network ?? paymentResponseData?.network ?? config.defaultChain,
+    chain: paymentCtx?.network ?? paymentResponseData?.network ?? "unknown",
     txHash: paymentResponseData?.transaction,
     // amount 为 API 必填字段：有支付则转换原始精度，无支付兜底传 "0"
     amount: formatUsdcAmount(paymentCtx?.amount) ?? "0",
@@ -183,14 +161,10 @@ export function buildTransactionPayload(
     tokenSymbol: paymentCtx?.tokenSymbol,
     payer: paymentResponseData?.payer,
     payee: paymentCtx?.payTo,
-    // 收款方对付款方的合规检查结果（payee 视角检查 payer）
+    // 收款方对付款方的 KYC 结果（payee 视角检查 payer）
     payerKycResult: mapKycToNumber(payeeCompliance?.kycCompleted, payeeCompliance?.kycStatus),
-    payerKytResult: mapKytDecisionToNumber(payeeCompliance?.kytDecision),
-    payerKytRiskLevel: mapRiskLevelToNumber(payeeCompliance?.riskLevel),
-    // 付款方对收款方的合规检查结果（payer 视角检查 payee）
+    // 付款方对收款方的 KYC 结果（payer 视角检查 payee）
     payeeKycResult: mapKycToNumber(payerCompliance?.kycCompleted, payerCompliance?.kycStatus as string | null | undefined),
-    payeeKytResult: mapKytDecisionToNumber(payerCompliance?.kytDecision),
-    payeeKytRiskLevel: mapRiskLevelToNumber(payerCompliance?.riskLevel),
     createdAt: toChinaTimeString(),
   };
 }

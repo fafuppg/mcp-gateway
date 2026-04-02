@@ -1,10 +1,15 @@
 /**
- * compliance.ts — KYC/KYT 合规检查模块
+ * compliance.ts — KYC 合规检查模块
  *
  * 职责：
- * 1) 对交易对手方执行 KYC（了解客户）和 KYT（了解交易）双重检查。
+ * 1) 对交易对手方执行 KYC（了解客户）检查。
  * 2) 返回结构化的合规决策（ComplianceDecision），供网关主流程判断是否放行支付。
  * 3) 从收款方响应中提取其对付款方的合规检查结果（PayeeComplianceDecision）。
+ *
+ * v2.0 变更：移除 KYT（了解交易）流程，仅保留 KYC 闸门。
+ *
+ * @author kuangyp
+ * @version 2026-04-02
  */
 
 // =====================================================================
@@ -17,14 +22,13 @@
  * 由主模块从环境变量中读取后注入，避免本模块直接耦合 process.env。
  */
 export interface ComplianceConfig {
-  baseUrl: string;     // KYC/KYT 接口域名（如 https://your-domain.com）
+  baseUrl: string;     // KYC 接口域名（如 https://your-domain.com）
   apiKey: string;      // API Key（以 agt_ 开头）
-  chain: string;       // KYT 查询链，如 "base"
   maxRetries: number;  // 接口最大重试次数（含首次）
 }
 
 // =====================================================================
-// KYC/KYT 接口返回结构（内部类型，不导出）
+// KYC 接口返回结构（内部类型，不导出）
 // =====================================================================
 
 /**
@@ -49,38 +53,6 @@ interface KycApiResponse {
   data: KycCheckData;
 }
 
-/**
- * KYT 接口返回结构（data 字段内容）。
- *
- * 业务放行关键字段：
- * - decision: pass / reject
- * - degraded: 如果为 true，表示上游服务降级，当前结果不可靠。
- */
-interface KytCheckData {
-  address: string;
-  chain: string;
-  riskLevel: string;
-  riskScore: number;
-  decision: "pass" | "reject";
-  signals: string[];
-  provider: string;
-  checkedAt: string;
-  cached: boolean;
-  reportUrl?: string;
-  degraded?: boolean;
-}
-
-/**
- * KYT 接口完整响应（含 code、msg、data 信封）。
- *
- * 成功时 code=80000000，业务数据在 data 中。
- */
-interface KytApiResponse {
-  code: number;
-  msg: string;
-  data: KytCheckData;
-}
-
 // =====================================================================
 // 导出的合规决策类型
 // =====================================================================
@@ -100,17 +72,11 @@ export interface ComplianceDecision {
   reasonCode:
     | "COMPLIANCE_PASSED"
     | "KYC_NOT_APPROVED"
-    | "KYT_REJECTED"
-    | "KYT_DEGRADED"
     | "COMPLIANCE_CONFIG_MISSING"
     | "COMPLIANCE_API_ERROR";
   message: string;
   kycStatus?: KycCheckData["kycStatus"];
   kycCompleted?: boolean;
-  kytDecision?: KytCheckData["decision"];
-  riskLevel?: string;
-  riskScore?: number;
-  degraded?: boolean;
   checkedAt: string;
 }
 
@@ -125,10 +91,6 @@ export interface PayeeComplianceDecision {
   payerAddress: string;
   kycCompleted: boolean;
   kycStatus: string | null;
-  kytDecision: string;
-  riskLevel: string;
-  riskScore: number;
-  degraded: boolean;
   checkedAt: string;
   passed: boolean;
   reasonCode: string;
@@ -202,7 +164,7 @@ async function postJson<T>(url: string, body: Record<string, unknown>, maxRetrie
 // =====================================================================
 
 /**
- * 执行 KYC + KYT 双重校验。
+ * 执行 KYC 合规校验。
  *
  * 返回结构化决策，便于上游清晰解释"通过/失败原因"。
  * 采用 fail-close 策略：配置缺失或接口异常时默认拒绝。
@@ -225,17 +187,10 @@ export async function runComplianceChecks(
   const successCode = 80000000;
 
   try {
-    const [kycRaw, kytRaw] = await Promise.all([
-      postJson<KycApiResponse>(`${baseUrl}/api/kyc/check`, {
-        apiKey: config.apiKey,
-        walletAddress: counterparty,
-      }, config.maxRetries),
-      postJson<KytApiResponse>(`${baseUrl}/api/compliance/kyt/check`, {
-        apiKey: config.apiKey,
-        walletAddress: counterparty,
-        chain: config.chain,
-      }, config.maxRetries),
-    ]);
+    const kycRaw = await postJson<KycApiResponse>(`${baseUrl}/api/kyc/check`, {
+      apiKey: config.apiKey,
+      walletAddress: counterparty,
+    }, config.maxRetries);
 
     // 校验接口返回信封：code 非成功码或 data 缺失时视为 API 错误
     if (kycRaw.code !== successCode || !kycRaw.data) {
@@ -246,20 +201,11 @@ export async function runComplianceChecks(
         checkedAt,
       };
     }
-    if (kytRaw.code !== successCode || !kytRaw.data) {
-      return {
-        serviceId, toolName, counterparty, passed: false,
-        reasonCode: "COMPLIANCE_API_ERROR",
-        message: `KYT API returned unexpected response: code=${kytRaw.code}, msg=${kytRaw.msg}`,
-        checkedAt,
-      };
-    }
 
     const kycResult = kycRaw.data;
-    const kytResult = kytRaw.data;
 
     console.error(
-      `🛡️ 合规结果：对手方=${counterparty}，KYC状态=${String(kycResult.kycStatus)}（已完成=${String(kycResult.kycCompleted)}），KYT决策=${kytResult.decision}，风险等级=${kytResult.riskLevel}，风险评分=${kytResult.riskScore}，降级=${String(kytResult.degraded === true)}`,
+      `🛡️ 合规结果：对手方=${counterparty}，KYC状态=${String(kycResult.kycStatus)}（已完成=${String(kycResult.kycCompleted)}）`,
     );
 
     const decisionBase = {
@@ -268,10 +214,6 @@ export async function runComplianceChecks(
       counterparty,
       kycStatus: kycResult.kycStatus,
       kycCompleted: kycResult.kycCompleted,
-      kytDecision: kytResult.decision,
-      riskLevel: kytResult.riskLevel,
-      riskScore: kytResult.riskScore,
-      degraded: kytResult.degraded === true,
       checkedAt,
     };
 
@@ -285,17 +227,7 @@ export async function runComplianceChecks(
       };
     }
 
-    // KYT decision 必须为 pass
-    if (kytResult.decision !== "pass") {
-      return {
-        ...decisionBase,
-        passed: false,
-        reasonCode: "KYT_REJECTED",
-        message: `KYT decision is ${kytResult.decision}.`,
-      };
-    }
-
-    // KYC + KYT 全部通过，允许支付
+    // KYC 通过，允许支付
     return {
       ...decisionBase,
       passed: true,

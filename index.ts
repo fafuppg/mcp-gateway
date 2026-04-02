@@ -1,28 +1,40 @@
 #!/usr/bin/env node
 /**
- * x402 MCP Gateway（付款侧网关）
+ * UAFG v2.0 — Universal Agent Financial Gateway（付款侧网关）
  *
  * 角色定位：
  * 1) 对上游 Agent（如 Cursor）暴露一个统一的 MCP 服务入口（stdio）。
  * 2) 将工具调用转发给一个或多个下游 MCP 服务。
- * 3) 当下游返回 x402 支付挑战时，网关使用本地钱包自动支付。
- * 4) 在自动支付前，执行 KYC/KYT 合规检查，不满足则拒绝支付。
+ * 3) 当下游返回支付挑战（PaymentRequired）时，网关自主执行合规校验和 AP2 风控。
+ * 4) 校验通过后，生成支付签名并携带凭证发起二次调用完成支付。
  * 5) 支付完成后，异步写入交易记录到 Dashboard。
  *
+ * v2.0 核心变更：
+ * - 脱离 @x402/mcp SDK 的黑盒回调，使用原生 MCP Client 自主控制支付流程。
+ * - 使用 @x402/core 的 x402Client 独立生成 PaymentPayload（签名授权）。
+ * - 移除 KYT 流程，仅保留 KYC 闸门。
+ * - KYC 与 AP2 验证并发执行，降低支付延迟。
+ *
  * 核心链路（简化）：
- * Agent -> gateway.call_service_tool -> downstream tool
- *      -> (如遇支付挑战) onPaymentRequested -> KYC/KYT -> allow/deny
- *      -> (支付完成后) recordTransaction -> Dashboard
+ * Agent -> gateway.call_service_tool -> 首次 callTool
+ *       -> 解析 PaymentRequired -> 并发 KYC + AP2
+ *       -> 生成 PaymentPayload -> 二次 callTool（含 _meta）
+ *       -> 提取回执 -> 异步 recordTransaction
+ *
+ * @author kuangyp
+ * @version 2026-04-02
  */
 import { config } from "dotenv";
 import { z } from "zod";
 import { privateKeyToAccount } from "viem/accounts";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { ExactEvmScheme } from "@x402/evm/exact/client";
-import { createx402MCPClient } from "@x402/mcp";
+import { x402Client } from "@x402/core/client";
+import { isPaymentRequired, type PaymentRequired } from "@x402/core/schemas";
 
 import {
   sleep,
@@ -56,7 +68,40 @@ config(); // 加载环境变量
 
 type JsonObject = Record<string, unknown>;
 type DownstreamTransportMode = "auto" | "sse" | "streamable-http";
-type DownstreamMcpClient = ReturnType<typeof createx402MCPClient>;
+
+/**
+ * 原生 MCP Client callTool 的返回结构（简化类型，保留网关所需字段）。
+ *
+ * 原始类型是复杂的联合类型（含 toolResult 分支等），
+ * 此处仅关注网关实际使用的字段，通过索引签名兼容其他未知字段。
+ */
+interface McpCallToolResult {
+  [key: string]: unknown;
+  content: Array<{ type: string; text?: string; [key: string]: unknown }>;
+  isError?: boolean;
+  structuredContent?: Record<string, unknown>;
+  _meta?: Record<string, unknown>;
+}
+
+/**
+ * 网关内部工具调用结果。
+ *
+ * 在原生 MCP callTool 返回的基础上，附加支付相关的元数据。
+ */
+interface GatewayToolCallResult {
+  content: McpCallToolResult["content"];
+  isError?: boolean;
+  /** 本次调用是否发生了支付 */
+  paymentMade: boolean;
+  /** 支付回执（来自 _meta["x402/payment-response"]），仅 paymentMade=true 时有值 */
+  paymentResponse: unknown;
+  /** 合规检查决策（仅发生支付挑战时有值） */
+  complianceDecision: ComplianceDecision | null;
+  /** AP2 保障验证结果（仅发生支付挑战且含 CartMandate 时有值） */
+  assuranceResult: AssuranceResult | null;
+  /** 支付上下文（金额/收款方/网络等） */
+  paymentContext: PaymentContext | null;
+}
 
 /**
  * 下游服务注册表记录。
@@ -65,14 +110,14 @@ type DownstreamMcpClient = ReturnType<typeof createx402MCPClient>;
  * - serviceId: 网关内部编号，便于在调用时指定目标下游。
  * - url: 下游 MCP 地址。
  * - transport: 实际连接成功使用的传输协议（streamable-http 或 sse）。
- * - client: 针对该下游的 x402 MCP 客户端实例。
+ * - client: 原生 MCP 客户端实例。
  * - tools: 下游已发现的工具清单。
  */
 interface DownstreamServiceRecord {
   serviceId: string;
   url: string;
   transport: Exclude<DownstreamTransportMode, "auto">;
-  client: DownstreamMcpClient;
+  client: Client;
   tools: Array<{ name: string; description?: string }>;
 }
 
@@ -98,6 +143,15 @@ interface GatewayEnvelope<TDetail = JsonObject> {
 }
 
 // =====================================================================
+// x402 协议常量
+// =====================================================================
+
+/** 二次调用时携带支付签名的 _meta key（x402 协议标准） */
+const MCP_PAYMENT_META_KEY = "x402/payment";
+/** 二次调用返回时服务端附带结算回执的 _meta key */
+const MCP_PAYMENT_RESPONSE_META_KEY = "x402/payment-response";
+
+// =====================================================================
 // 配置读取
 // =====================================================================
 
@@ -111,7 +165,19 @@ const evmPrivateKey = requireHexPrivateKey("EVM_PRIVATE_KEY");
 const gatewayAccount = privateKeyToAccount(evmPrivateKey);
 const gatewayWalletAddress = gatewayAccount.address;
 
-/** 合规服务配置（KYC/KYT 接口共用） */
+/**
+ * 模块级 x402 支付客户端（独立于 MCP，专门负责生成支付签名）。
+ *
+ * 内部注册了 ExactEvmScheme，调用 createPaymentPayload 时自动完成：
+ * 1) 从 PaymentRequired.accepts 中按已注册 scheme 过滤
+ * 2) 选择最优的 PaymentRequirements
+ * 3) 调用 ExactEvmScheme 生成 EIP-3009 / Permit2 签名
+ * 4) 包装为完整的 PaymentPayload（含 x402Version / resource / accepted）
+ */
+const paymentClient = new x402Client();
+paymentClient.register("eip155:84532", new ExactEvmScheme(gatewayAccount));
+
+/** 合规服务配置（仅 KYC） */
 const complianceConfig: ComplianceConfig | null = (() => {
   const baseUrl = process.env.COMPLIANCE_BASE_URL;
   const apiKey = process.env.COMPLIANCE_API_KEY;
@@ -119,42 +185,23 @@ const complianceConfig: ComplianceConfig | null = (() => {
     console.error("⚠️ 合规配置不完整（COMPLIANCE_BASE_URL 或 COMPLIANCE_API_KEY 缺失），合规检查将拒绝所有支付");
     return null;
   }
-  return {
-    baseUrl,
-    apiKey,
-    chain: process.env.COMPLIANCE_CHAIN ?? "base",
-    maxRetries: 5,
-  };
+  return { baseUrl, apiKey, maxRetries: 5 };
 })();
 
 /** 交易记录服务配置（与合规服务共享域名和 API Key） */
 const transactionConfig: TransactionConfig | null = complianceConfig
-  ? { baseUrl: complianceConfig.baseUrl, apiKey: complianceConfig.apiKey, defaultChain: complianceConfig.chain }
+  ? { baseUrl: complianceConfig.baseUrl, apiKey: complianceConfig.apiKey }
   : null;
 
 /**
  * AP2 验证服务配置。
  *
- * 与合规服务（KYC/KYT）共用同一个 Dashboard 的 baseUrl 和 apiKey，
+ * 与合规服务共用同一个 Dashboard 的 baseUrl 和 apiKey，
  * 无需额外配置新的环境变量。
  */
 const assuranceConfig: AssuranceConfig | null = complianceConfig
   ? { baseUrl: complianceConfig.baseUrl, apiKey: complianceConfig.apiKey }
   : null;
-
-/** 缓存每个 service 最近一次合规结果，供响应回传 */
-const latestComplianceDecisionByService = new Map<string, ComplianceDecision>();
-/** 缓存每个 service 最近一次 AP2 保障验证结果，供响应回传 */
-const latestAssuranceResultByService = new Map<string, AssuranceResult>();
-/** 缓存每个 service 最近一次支付上下文，供响应透传资金流向 */
-const latestPaymentContextByService = new Map<string, PaymentContext>();
-/**
- * 进行中的 AP2 校验 Promise 缓存（按 serviceId）。
- *
- * x402 SDK 在某些情况下会对同一次支付并发触发多次 onPaymentRequested 回调，
- * 通过此 Map 复用正在执行的校验，避免重复发起 API 请求。
- */
-const pendingAssuranceByService = new Map<string, Promise<AssuranceResult>>();
 
 const rawDownstreamUrls = process.env.DOWNSTREAM_MCP_URLS ?? process.env.DOWNSTREAM_MCP_URL;
 if (!rawDownstreamUrls) {
@@ -222,9 +269,9 @@ function isValidEvmAddress(value: string): value is `0x${string}` {
 }
 
 /**
- * 从 x402 paymentRequired.accepts[0].extra 中提取 CartMandate。
+ * 从 paymentRequired.accepts[0].extra 中提取 CartMandate。
  *
- * 下游服务器（simple.ts）将 CartMandate 对象嵌套放在 extra.cartMandate 字段中，
+ * 下游服务器将 CartMandate 对象嵌套放在 extra.cartMandate 字段中，
  * 保留 extra 顶层的 name/version（EIP-712 domain 参数）不受干扰：
  *   extra = { name: "USDC", version: "2", cartMandate: { merchant_id, ... } }
  *
@@ -239,7 +286,7 @@ function extractCartMandate(extra: unknown): CartMandate | null {
   if (!extra || typeof extra !== "object") return null;
   const obj = extra as Record<string, unknown>;
 
-  // 优先从嵌套的 cartMandate 字段提取（下游 simple.ts 的标准输出格式）
+  // 优先从嵌套的 cartMandate 字段提取（下游标准输出格式）
   const nested = obj.cartMandate;
   const source: Record<string, unknown> =
     nested && typeof nested === "object" ? (nested as Record<string, unknown>) : obj;
@@ -256,7 +303,6 @@ function extractCartMandate(extra: unknown): CartMandate | null {
   return {
     merchant_id: source.merchant_id,
     merchant_address: source.merchant_address,
-    // total_amount 为人类可读格式（如 "0.1"），与 VC 中 perTxLimit 单位一致
     total_amount: typeof source.total_amount === "string" ? source.total_amount : String(source.total_amount ?? "0"),
     currency: typeof source.currency === "string" ? source.currency : undefined,
     pay_to: typeof source.pay_to === "string" ? source.pay_to : undefined,
@@ -273,6 +319,48 @@ function extractCounterpartyAddress(payTo: unknown): `0x${string}` | null {
 }
 
 // =====================================================================
+// 支付挑战解析（从 x402 SDK 移植的核心逻辑）
+// =====================================================================
+
+/**
+ * 从 MCP callTool 返回结果中解析 PaymentRequired 支付挑战。
+ *
+ * 检测逻辑（与 x402 SDK 的 extractPaymentRequiredFromResult 一致）：
+ * 1) 结果必须是 isError: true（支付挑战以错误形式返回）
+ * 2) 优先检查 structuredContent 中是否直接包含 PaymentRequired 对象
+ * 3) 回退检查 content[0].text 中的 JSON 字符串
+ * 4) 通过 @x402/core/schemas 的 isPaymentRequired 进行结构验证
+ *
+ * 若不是支付挑战（普通工具结果或普通错误），返回 null。
+ *
+ * @param result 原生 MCP Client callTool 的返回值。
+ * @returns PaymentRequired 对象（若为支付挑战），或 null。
+ */
+function extractPaymentRequiredFromResult(result: McpCallToolResult): PaymentRequired | null {
+  if (!result.isError) return null;
+
+  // 优先检查 structuredContent（x402 MCP transport 首选格式）
+  if (result.structuredContent && isPaymentRequired(result.structuredContent)) {
+    return result.structuredContent;
+  }
+
+  // 回退检查 content[0].text 中的 JSON
+  if (!result.content || result.content.length === 0) return null;
+  const firstItem = result.content[0];
+  if (firstItem.type !== "text" || typeof firstItem.text !== "string") return null;
+
+  try {
+    const parsed = JSON.parse(firstItem.text);
+    if (typeof parsed === "object" && parsed !== null && isPaymentRequired(parsed)) {
+      return parsed as PaymentRequired;
+    }
+  } catch {
+    // 非 JSON 文本，不是支付挑战
+  }
+  return null;
+}
+
+// =====================================================================
 // 网关内部工具
 // =====================================================================
 
@@ -281,11 +369,190 @@ function createTraceId(): string {
   return `trace_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 }
 
-/** 获取指定 service + tool 的最近一次合规决策 */
-function getLatestComplianceDecision(serviceId: string, toolName: string): ComplianceDecision | undefined {
-  const decision = latestComplianceDecisionByService.get(serviceId);
-  if (!decision || decision.toolName !== toolName) return undefined;
-  return decision;
+// =====================================================================
+// 核心支付处理管线
+// =====================================================================
+
+/**
+ * 带支付处理的工具调用（网关控制流核心）。
+ *
+ * 完整流程：
+ * 1) 通过原生 MCP Client 发起首次 callTool
+ * 2) 解析返回结果，判断是否为支付挑战（PaymentRequired）
+ * 3) 若非支付挑战，直接返回结果
+ * 4) 若为支付挑战：
+ *    a) 提取收款方地址和 CartMandate
+ *    b) 并发执行 KYC 合规检查 + AP2 三重验签
+ *    c) 双重校验通过后，调用 x402Client 生成 PaymentPayload（签名授权）
+ *    d) 携带签名在 _meta["x402/payment"] 中发起二次 callTool
+ *    e) 从二次调用结果的 _meta["x402/payment-response"] 中提取支付回执
+ * 5) 异步写入交易记录
+ *
+ * @param client 原生 MCP Client（已连接到下游）。
+ * @param serviceId 下游服务标识符。
+ * @param toolName 要调用的下游工具名。
+ * @param args 传递给下游工具的参数。
+ * @returns 网关工具调用结果（含支付元数据）。
+ */
+async function callToolWithPaymentHandling(
+  client: Client,
+  serviceId: string,
+  toolName: string,
+  args: JsonObject,
+): Promise<GatewayToolCallResult> {
+  // ── Step 1: 首次调用 ──────────────────────────────────────────────
+  const firstResult = await client.callTool({ name: toolName, arguments: args }) as McpCallToolResult;
+
+  // ── Step 2: 解析支付挑战 ──────────────────────────────────────────
+  const paymentRequired = extractPaymentRequiredFromResult(firstResult);
+  if (!paymentRequired) {
+    // 非支付挑战：普通成功或普通错误，直接返回
+    return {
+      content: firstResult.content,
+      isError: firstResult.isError,
+      paymentMade: false,
+      paymentResponse: null,
+      complianceDecision: null,
+      assuranceResult: null,
+      paymentContext: null,
+    };
+  }
+
+  console.error(`💳 检测到支付挑战：服务=${serviceId}，工具=${toolName}，accepts数量=${paymentRequired.accepts.length}`);
+
+  // ── Step 3: 提取支付上下文 ────────────────────────────────────────
+  const accepted = paymentRequired.accepts[0];
+  if (!accepted) {
+    throw new Error("PaymentRequired.accepts is empty, cannot proceed with payment.");
+  }
+
+  const counterparty = extractCounterpartyAddress(accepted.payTo);
+  if (!counterparty) {
+    throw new Error(`Invalid counterparty address in PaymentRequired: payTo=${String(accepted.payTo)}`);
+  }
+
+  const acceptedAny = accepted as Record<string, unknown>;
+  const extra = acceptedAny.extra as Record<string, unknown> | undefined;
+  const cartMandate = extractCartMandate(extra);
+
+  // V1 uses maxAmountRequired, V2 uses amount
+  const rawAmount = String(acceptedAny.maxAmountRequired ?? acceptedAny.amount ?? "0");
+
+  const paymentCtx: PaymentContext = {
+    amount: rawAmount,
+    payTo: counterparty,
+    network: accepted.network,
+    tokenSymbol: (extra?.["name"] as string | undefined) ?? "UNKNOWN",
+  };
+
+  // ── Step 4: 并发执行 KYC + AP2 ───────────────────────────────────
+  // 合规配置缺失时直接拒绝（fail-close）
+  if (!complianceConfig) {
+    const decision: ComplianceDecision = {
+      serviceId, toolName, counterparty, passed: false,
+      reasonCode: "COMPLIANCE_CONFIG_MISSING",
+      message: "Compliance configuration is missing.",
+      checkedAt: new Date().toISOString(),
+    };
+    throw new PaymentRejectedError("compliance_check", decision, null, paymentCtx);
+  }
+
+  // KYC 和 AP2 并发调度
+  const compliancePromise = runComplianceChecks(complianceConfig, serviceId, toolName, counterparty);
+
+  let assurancePromise: Promise<AssuranceResult | null>;
+  if (cartMandate && assuranceConfig) {
+    assurancePromise = runAssuranceCheck(assuranceConfig, gatewayWalletAddress, cartMandate);
+  } else if (cartMandate && !assuranceConfig) {
+    // 含 CartMandate 但缺少 AP2 配置，fail-close 拒绝
+    const failResult: AssuranceResult = {
+      passed: false,
+      errorCode: "CART_MANDATE_MISSING",
+      errorMessage: "Assurance configuration is missing but CartMandate is present.",
+      checkedAt: new Date().toISOString(),
+    };
+    assurancePromise = Promise.resolve(failResult);
+  } else {
+    // 非 AP2 场景（无 CartMandate），跳过 AP2 校验
+    assurancePromise = Promise.resolve(null);
+  }
+
+  const [complianceDecision, assuranceResult] = await Promise.all([compliancePromise, assurancePromise]);
+
+  // 校验合规结果
+  if (!complianceDecision.passed) {
+    console.error(
+      `🚫 支付拒绝（KYC）：服务=${serviceId}，工具=${toolName}，原因=${complianceDecision.reasonCode}，对手方=${counterparty}`,
+    );
+    throw new PaymentRejectedError("compliance_check", complianceDecision, assuranceResult, paymentCtx);
+  }
+
+  // 校验 AP2 结果（仅当 AP2 校验实际执行时检查）
+  if (assuranceResult !== null && !assuranceResult.passed) {
+    console.error(
+      `🚫 支付拒绝（AP2）：服务=${serviceId}，工具=${toolName}，原因=${assuranceResult.errorCode}，详情=${assuranceResult.errorMessage}`,
+    );
+    throw new PaymentRejectedError("assurance_check", complianceDecision, assuranceResult, paymentCtx);
+  }
+
+  console.error(
+    `💰 支付放行：服务=${serviceId}，工具=${toolName}，金额=${paymentCtx.amount}，网络=${paymentCtx.network}，收款方=${counterparty}`,
+  );
+
+  // ── Step 5: 生成 PaymentPayload（签名授权） ───────────────────────
+  // schemas 与 client 子模块对 PaymentRequired 的 TS 类型定义有细微差异（联合 vs 扁平）
+  // 运行时已通过 isPaymentRequired 校验，此处安全断言
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const paymentPayload = await paymentClient.createPaymentPayload(paymentRequired as any);
+
+  // ── Step 6: 二次调用（携带支付签名） ──────────────────────────────
+  const paidResult = await client.callTool({
+    name: toolName,
+    arguments: args,
+    _meta: { [MCP_PAYMENT_META_KEY]: paymentPayload },
+  }) as McpCallToolResult;
+
+  // ── Step 7: 提取支付回执 ──────────────────────────────────────────
+  const paymentResponse = paidResult._meta?.[MCP_PAYMENT_RESPONSE_META_KEY] ?? null;
+
+  return {
+    content: paidResult.content,
+    isError: paidResult.isError,
+    paymentMade: true,
+    paymentResponse,
+    complianceDecision,
+    assuranceResult,
+    paymentContext: paymentCtx,
+  };
+}
+
+// =====================================================================
+// 支付拒绝异常（结构化，便于 catch 中提取上下文）
+// =====================================================================
+
+/**
+ * 支付被网关策略拒绝时抛出的结构化异常。
+ *
+ * 携带完整的拒绝上下文（阶段、合规决策、AP2 结果、支付上下文），
+ * 供 catch 块构建结构化的 GatewayEnvelope 响应。
+ */
+class PaymentRejectedError extends Error {
+  constructor(
+    public readonly stage: "compliance_check" | "assurance_check",
+    public readonly complianceDecision: ComplianceDecision,
+    public readonly assuranceResult: AssuranceResult | null,
+    public readonly paymentContext: PaymentContext | null,
+  ) {
+    const isAssurance = stage === "assurance_check" && assuranceResult && !assuranceResult.passed;
+    const code = isAssurance
+      ? (assuranceResult!.errorCode ?? "ASSURANCE_FAILED")
+      : complianceDecision.reasonCode;
+    const msg = isAssurance
+      ? (assuranceResult!.errorMessage ?? "AP2 assurance check failed.")
+      : complianceDecision.message;
+    super(`Payment rejected: [${code}] ${msg}`);
+    this.name = "PaymentRejectedError";
+  }
 }
 
 // =====================================================================
@@ -302,13 +569,13 @@ function getTransportCandidates(
 }
 
 /**
- * 连接单个下游 MCP 客户端（带协议回退 + 重试）。
+ * 连接单个下游原生 MCP 客户端（带协议回退 + 重试）。
  *
  * 按候选协议逐个尝试，每种协议按 connectRetries 次重试，
  * 失败后短暂退避，记录所有失败原因最终一次性抛出。
  */
 async function connectWithTransportFallback(
-  client: DownstreamMcpClient,
+  client: Client,
   url: string,
   mode: DownstreamTransportMode,
 ): Promise<Exclude<DownstreamTransportMode, "auto">> {
@@ -356,122 +623,21 @@ function extractErrorCause(error: unknown): string {
 // =====================================================================
 
 /**
- * 为单个下游创建 x402 MCP 客户端并完成连接。
+ * 为单个下游创建原生 MCP 客户端并完成连接。
  *
- * 核心支付控制点：
- * - autoPayment=true：遇到支付挑战时自动支付。
- * - onPaymentRequested：支付前拦截，执行 KYC/KYT 检查决定放行或拒绝。
+ * v2.0 变更：使用原生 @modelcontextprotocol/sdk Client，
+ * 不再通过 @x402/mcp 的 createx402MCPClient 包装。
+ * 支付逻辑完全由网关的 callToolWithPaymentHandling 自主控制。
  */
 async function createAndConnectDownstreamClient(
   serviceId: string,
   url: string,
   mode: DownstreamTransportMode,
 ): Promise<{
-  client: DownstreamMcpClient;
+  client: Client;
   transport: Exclude<DownstreamTransportMode, "auto">;
 }> {
-  // 使用模块级账户实例，避免每个下游重复创建（所有下游共用同一钱包）
-  const client = createx402MCPClient({
-    name: `gateway-${serviceId}`,
-    version: "1.0.0",
-    schemes: [{ network: "eip155:84532", client: new ExactEvmScheme(gatewayAccount) }],
-    autoPayment: true,
-    onPaymentRequested: async (context: {
-      toolName: string;
-      paymentRequired: {
-        accepts: Array<{
-          payTo?: unknown;
-          amount: string;
-          network: string;
-          // extra 扩展为宽松类型，以兼容 AP2 CartMandate 字段
-          extra?: Record<string, unknown>;
-        }>;
-      };
-    }) => {
-      const accepted = context.paymentRequired.accepts[0];
-      const counterparty = extractCounterpartyAddress(accepted.payTo);
-
-      if (!counterparty) {
-        console.error(
-          `🚫 支付拒绝：服务=${serviceId}，工具=${context.toolName}，原因=收款方地址无效，payTo=${String(accepted.payTo)}`,
-        );
-        return false;
-      }
-
-      // ── 第一关：合规检查（KYC/KYT）────────────────────────────────
-      // 配置缺失时直接拒绝（fail-close）
-      if (!complianceConfig) {
-        console.error(`🚫 支付拒绝：服务=${serviceId}，工具=${context.toolName}，原因=合规配置缺失`);
-        latestComplianceDecisionByService.set(serviceId, {
-          serviceId, toolName: context.toolName, counterparty, passed: false,
-          reasonCode: "COMPLIANCE_CONFIG_MISSING", message: "Compliance configuration is missing.",
-          checkedAt: new Date().toISOString(),
-        });
-        return false;
-      }
-
-      const complianceDecision = await runComplianceChecks(
-        complianceConfig, serviceId, context.toolName, counterparty,
-      );
-      latestComplianceDecisionByService.set(serviceId, complianceDecision);
-
-      if (!complianceDecision.passed) {
-        console.error(
-          `🚫 支付拒绝（KYC/KYT）：服务=${serviceId}，工具=${context.toolName}，原因=${complianceDecision.reasonCode}，对手方=${counterparty}`,
-        );
-        return false;
-      }
-
-      // ── 第二关：AP2 保障验证（商户验签 + VC 验签 + 预算校验）──────
-      // 从 extra 中提取 CartMandate，不存在则跳过（向后兼容非 AP2 下游）
-      const cartMandate = extractCartMandate(accepted.extra);
-      if (cartMandate) {
-        if (!assuranceConfig) {
-          // AP2 相关下游出现时合规配置不完整，fail-close 拒绝
-          console.error(`🚫 支付拒绝（AP2）：服务=${serviceId}，工具=${context.toolName}，原因=AP2 验证配置缺失`);
-          latestAssuranceResultByService.set(serviceId, {
-            passed: false,
-            errorCode: "CART_MANDATE_MISSING",
-            errorMessage: "Assurance configuration is missing but CartMandate is present.",
-            checkedAt: new Date().toISOString(),
-          });
-          return false;
-        }
-
-        // 复用正在进行的校验 Promise，防止 SDK 并发触发多次回调时重复发起 API 请求
-        let assurancePromise = pendingAssuranceByService.get(serviceId);
-        if (!assurancePromise) {
-          assurancePromise = runAssuranceCheck(assuranceConfig, gatewayWalletAddress, cartMandate);
-          pendingAssuranceByService.set(serviceId, assurancePromise);
-          // 校验结束后（无论成功失败）清除 pending 标记
-          assurancePromise.finally(() => pendingAssuranceByService.delete(serviceId));
-        }
-        const assuranceResult = await assurancePromise;
-        latestAssuranceResultByService.set(serviceId, assuranceResult);
-
-        if (!assuranceResult.passed) {
-          console.error(
-            `🚫 支付拒绝（AP2）：服务=${serviceId}，工具=${context.toolName}，原因=${assuranceResult.errorCode}，详情=${assuranceResult.errorMessage}`,
-          );
-          return false;
-        }
-      }
-
-      // ── 两关均通过：缓存支付上下文，放行支付 ────────────────────────
-      latestPaymentContextByService.set(serviceId, {
-        amount: accepted.amount,
-        payTo: counterparty,
-        network: accepted.network,
-        tokenSymbol: (accepted.extra?.["name"] as string | undefined) ?? "UNKNOWN",
-      });
-
-      console.error(
-        `💰 支付放行：服务=${serviceId}，工具=${context.toolName}，金额=${accepted.amount}，网络=${accepted.network}，收款方=${counterparty}`,
-      );
-      return true;
-    },
-  });
-
+  const client = new Client({ name: `gateway-${serviceId}`, version: "2.0.0" });
   const selectedTransport = await connectWithTransportFallback(client, url, mode);
   return { client, transport: selectedTransport };
 }
@@ -557,28 +723,25 @@ function registerGatewayTools(mcpServer: McpServer, registry: DownstreamServiceR
       const service = selectService(registry, args.serviceId);
 
       try {
-        const result = await service.client.callTool(args.toolName, args.args ?? {});
-        const latestCompliance = getLatestComplianceDecision(service.serviceId, args.toolName);
-        const latestPaymentCtx = latestPaymentContextByService.get(service.serviceId) ?? null;
+        const result = await callToolWithPaymentHandling(
+          service.client, service.serviceId, args.toolName, args.args ?? {},
+        );
+
         const payeeCompliance = extractPayeeCompliance(result.content);
         const paymentResponseData = extractPaymentResponseData(result.paymentResponse);
 
         // 异步写入交易记录（fire-and-forget），仅在实际发生支付时记录
         if (result.paymentMade && transactionConfig) {
-          const latestAssuranceForTx = latestAssuranceResultByService.get(service.serviceId) ?? null;
           recordTransaction(transactionConfig, buildTransactionPayload(transactionConfig, {
             toolName: args.toolName,
             serviceResult: "pass",
-            paymentCtx: latestPaymentCtx,
+            paymentCtx: result.paymentContext,
             paymentResponseData,
-            payerCompliance: latestCompliance ?? null,
+            payerCompliance: result.complianceDecision,
             payeeCompliance,
-            // AP2 通过时携带 mandateId，非 AP2 场景传空字符串
-            intentMandateId: latestAssuranceForTx?.mandateId ?? "",
+            intentMandateId: result.assuranceResult?.mandateId ?? "",
           }));
         }
-
-        const latestAssurance = latestAssuranceResultByService.get(service.serviceId) ?? null;
 
         const response: GatewayEnvelope<{
           serviceId: string;
@@ -600,75 +763,107 @@ function registerGatewayTools(mcpServer: McpServer, registry: DownstreamServiceR
           detail: {
             serviceId: service.serviceId,
             toolName: args.toolName,
-            paymentMade: result.paymentMade ?? false,
-            paymentResponse: result.paymentResponse ?? null,
-            complianceDecision: latestCompliance ?? null,
-            assuranceResult: latestAssurance,
+            paymentMade: result.paymentMade,
+            paymentResponse: result.paymentResponse,
+            complianceDecision: result.complianceDecision,
+            assuranceResult: result.assuranceResult,
             payeeComplianceDecision: payeeCompliance,
-            paymentContext: (result.paymentMade ?? false) ? latestPaymentCtx : null,
+            paymentContext: result.paymentMade ? result.paymentContext : null,
             downstreamContent: result.content,
           },
         };
 
         return { content: [{ type: "text", text: JSON.stringify(response, null, 2) }] };
       } catch (error) {
-        const latestCompliance = getLatestComplianceDecision(service.serviceId, args.toolName);
-        const latestPaymentCtx = latestPaymentContextByService.get(service.serviceId) ?? null;
+        // 支付被网关策略拒绝（结构化异常）
+        if (error instanceof PaymentRejectedError) {
+          // 异步写入交易记录：合规/AP2 拒绝 → "reject"
+          if (transactionConfig) {
+            recordTransaction(transactionConfig, buildTransactionPayload(transactionConfig, {
+              toolName: args.toolName,
+              serviceResult: "reject",
+              paymentCtx: error.paymentContext,
+              paymentResponseData: null,
+              payerCompliance: error.complianceDecision,
+              payeeCompliance: null,
+              intentMandateId: "",
+            }));
+          }
+
+          const isAssurance = error.stage === "assurance_check" && error.assuranceResult && !error.assuranceResult.passed;
+          const failCode = isAssurance
+            ? (error.assuranceResult!.errorCode ?? "ASSURANCE_FAILED")
+            : error.complianceDecision.reasonCode;
+          const failMessage = isAssurance
+            ? (error.assuranceResult!.errorMessage ?? "AP2 assurance check failed.")
+            : error.complianceDecision.message;
+
+          const response: GatewayEnvelope<{
+            serviceId: string;
+            toolName: string;
+            complianceDecision: ComplianceDecision | null;
+            assuranceResult: AssuranceResult | null;
+            payeeComplianceDecision: null;
+            paymentContext: PaymentContext | null;
+            downstreamError: string;
+          }> = {
+            ok: false,
+            stage: error.stage,
+            code: failCode,
+            message: failMessage,
+            traceId,
+            timestamp: new Date().toISOString(),
+            detail: {
+              serviceId: service.serviceId,
+              toolName: args.toolName,
+              complianceDecision: error.complianceDecision,
+              assuranceResult: error.assuranceResult,
+              payeeComplianceDecision: null,
+              paymentContext: error.paymentContext,
+              downstreamError: error.message,
+            },
+          };
+
+          return { content: [{ type: "text", text: JSON.stringify(response, null, 2) }] };
+        }
+
+        // 其他异常（下游不可达、签名生成失败等）
         const errorMessage = error instanceof Error ? error.message : String(error);
 
-        // 异步写入交易记录：合规拒绝 → "reject"，其他异常 → "error"
         if (transactionConfig) {
-          const failResult = latestCompliance && !latestCompliance.passed ? "reject" as const : "error" as const;
           recordTransaction(transactionConfig, buildTransactionPayload(transactionConfig, {
             toolName: args.toolName,
-            serviceResult: failResult,
-            paymentCtx: latestPaymentCtx,
+            serviceResult: "error",
+            paymentCtx: null,
             paymentResponseData: null,
-            payerCompliance: latestCompliance ?? null,
+            payerCompliance: null,
             payeeCompliance: null,
-            // 失败路径：支付未发生，mandateId 无意义，传空字符串
             intentMandateId: "",
           }));
         }
 
-        const latestAssuranceFail = latestAssuranceResultByService.get(service.serviceId) ?? null;
-        // 判断失败阶段：AP2 拒绝优先级高于合规拒绝（已按 onPaymentRequested 执行顺序排列）
-        const isAssuranceFail = latestAssuranceFail !== null && !latestAssuranceFail.passed;
-        const isComplianceFail = latestCompliance != null && !latestCompliance.passed;
-        const failStage = isAssuranceFail ? "assurance_check" : isComplianceFail ? "compliance_check" : "tool_execution";
-        const failCode = isAssuranceFail
-          ? (latestAssuranceFail.errorCode ?? "ASSURANCE_FAILED")
-          : isComplianceFail
-            ? latestCompliance!.reasonCode
-            : "TOOL_CALL_FAILED";
-        const failMessage = isAssuranceFail
-          ? (latestAssuranceFail.errorMessage ?? "AP2 assurance check failed.")
-          : isComplianceFail
-            ? latestCompliance!.message
-            : "Downstream tool call failed.";
-
         const response: GatewayEnvelope<{
           serviceId: string;
           toolName: string;
-          complianceDecision: ComplianceDecision | null;
-          assuranceResult: AssuranceResult | null;
-          payeeComplianceDecision: PayeeComplianceDecision | null;
-          paymentContext: PaymentContext | null;
+          complianceDecision: null;
+          assuranceResult: null;
+          payeeComplianceDecision: null;
+          paymentContext: null;
           downstreamError: string;
         }> = {
           ok: false,
-          stage: failStage,
-          code: failCode,
-          message: failMessage,
+          stage: "tool_execution",
+          code: "TOOL_CALL_FAILED",
+          message: "Downstream tool call failed.",
           traceId,
           timestamp: new Date().toISOString(),
           detail: {
             serviceId: service.serviceId,
             toolName: args.toolName,
-            complianceDecision: latestCompliance ?? null,
-            assuranceResult: latestAssuranceFail,
+            complianceDecision: null,
+            assuranceResult: null,
             payeeComplianceDecision: null,
-            paymentContext: latestPaymentCtx,
+            paymentContext: null,
             downstreamError: errorMessage,
           },
         };
@@ -684,7 +879,7 @@ function registerGatewayTools(mcpServer: McpServer, registry: DownstreamServiceR
 // =====================================================================
 
 function buildGatewayMcpServer(registry: DownstreamServiceRecord[]): McpServer {
-  const mcpServer = new McpServer({ name: "x402 Gateway MCP", version: "1.0.0" });
+  const mcpServer = new McpServer({ name: "UAFG Gateway MCP", version: "2.0.0" });
   registerGatewayTools(mcpServer, registry);
   return mcpServer;
 }

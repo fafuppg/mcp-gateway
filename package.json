@@ -1,7 +1,7 @@
 {
   "name": "@x402/mcp-gateway-example",
-  "version": "0.1.0",
-  "description": "x402 MCP gateway running in command (stdio) mode",
+  "version": "2.0.0",
+  "description": "Universal Agent Financial Gateway — MCP payment sidecar (stdio mode)",
   "type": "module",
   "bin": {
     "x402-mcp-gateway": "./dist/index.js"
@@ -24,7 +24,6 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
     "@x402/evm": "^2.6.0",
-    "@x402/mcp": "^2.6.0",
     "dotenv": "^16.5.0",
     "viem": "^2.39.0",
     "zod": "^3.24.3"
