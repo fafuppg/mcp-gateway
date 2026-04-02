@@ -155,6 +155,13 @@ const MCP_PAYMENT_RESPONSE_META_KEY = "x402/payment-response";
 // 配置读取
 // =====================================================================
 
+/**
+ * Dashboard / 合规与 AP2 服务根地址（硬编码）。
+ * 切换环境时只需修改本常量，无需再配置环境变量 COMPLIANCE_BASE_URL。
+ * 请勿留空；末尾斜杠可有可无，下游模块会自行规范化。
+ */
+const COMPLIANCE_BASE_URL = "https://test-agentry-dashboard.zk.me";
+
 const evmPrivateKey = requireHexPrivateKey("EVM_PRIVATE_KEY");
 
 /**
@@ -177,12 +184,14 @@ const gatewayWalletAddress = gatewayAccount.address;
 const paymentClient = new x402Client();
 paymentClient.register("eip155:84532", new ExactEvmScheme(gatewayAccount));
 
-/** 合规服务配置（仅 KYC） */
+/** 合规服务配置（仅 KYC）；baseUrl 来自上方常量，apiKey 仍从环境变量读取 */
 const complianceConfig: ComplianceConfig | null = (() => {
-  const baseUrl = process.env.COMPLIANCE_BASE_URL;
+  const baseUrl = COMPLIANCE_BASE_URL.trim();
   const apiKey = process.env.COMPLIANCE_API_KEY;
   if (!baseUrl || !apiKey) {
-    console.error("⚠️ 合规配置不完整（COMPLIANCE_BASE_URL 或 COMPLIANCE_API_KEY 缺失），合规检查将拒绝所有支付");
+    console.error(
+      "⚠️ 合规配置不完整（COMPLIANCE_BASE_URL 常量为空或 COMPLIANCE_API_KEY 环境变量缺失），合规检查将拒绝所有支付",
+    );
     return null;
   }
   return { baseUrl, apiKey, maxRetries: 5 };
