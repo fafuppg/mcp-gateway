@@ -7,9 +7,10 @@
  * 3) 从收款方响应中提取其对付款方的合规检查结果（PayeeComplianceDecision）。
  *
  * v2.0 变更：移除 KYT（了解交易）流程，仅保留 KYC 闸门。
+ * v3.0 变更：身份标识从 EVM 钱包地址改为 Agentry ID，KYC 请求参数对应变更。
  *
  * @author kuangyp
- * @version 2026-04-02
+ * @version 2026-04-03
  */
 
 // =====================================================================
@@ -34,10 +35,11 @@ export interface ComplianceConfig {
 /**
  * KYC 接口返回结构（data 字段内容）。
  *
+ * v3.0 变更：身份标识从 walletAddress 改为 agentryId。
  * 仅当 kycCompleted = true 且 kycStatus = approved 才视为 KYC 通过。
  */
 interface KycCheckData {
-  walletAddress: string;
+  agentryId: string;
   kycCompleted: boolean;
   kycStatus: "approved" | "pending" | "rejected" | null;
 }
@@ -67,7 +69,8 @@ interface KycApiResponse {
 export interface ComplianceDecision {
   serviceId: string;
   toolName: string;
-  counterparty: `0x${string}`;
+  /** 对手方标识（Agentry ID，如 AGT-M001），v3.0 起不再使用钱包地址 */
+  counterparty: string;
   passed: boolean;
   reasonCode:
     | "COMPLIANCE_PASSED"
@@ -179,7 +182,7 @@ export async function runComplianceChecks(
   config: ComplianceConfig,
   serviceId: string,
   toolName: string,
-  counterparty: `0x${string}`,
+  counterparty: string,
 ): Promise<ComplianceDecision> {
   const checkedAt = new Date().toISOString();
 
@@ -189,7 +192,7 @@ export async function runComplianceChecks(
   try {
     const kycRaw = await postJson<KycApiResponse>(`${baseUrl}/api/kyc/check`, {
       apiKey: config.apiKey,
-      walletAddress: counterparty,
+      agentryId: counterparty,
     }, config.maxRetries);
 
     // 校验接口返回信封：code 非成功码或 data 缺失时视为 API 错误

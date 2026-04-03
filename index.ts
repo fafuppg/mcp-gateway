@@ -15,14 +15,21 @@
  * - 移除 KYT 流程，仅保留 KYC 闸门。
  * - KYC 与 AP2 验证并发执行，降低支付延迟。
  *
+ * v3.0 核心变更：
+ * - 身份标识从 EVM 钱包地址改为 Agentry ID（KYC / AP2 接口参数适配）。
+ * - AP2 验证从本地密码学（EIP-191 / EIP-712）改为 Dashboard verify-batch API。
+ * - CartMandate 从含 merchant_signature 的扁平结构改为含 W3C VC（vcJson）的完整结构。
+ * - 二次调用时在 _meta 中注入 agentry/payer-id，供下游 Hub 做收款侧审计。
+ * - EVM 钱包仅用于 x402 PaymentPayload 签名，不再用于身份标识。
+ *
  * 核心链路（简化）：
  * Agent -> gateway.call_service_tool -> 首次 callTool
- *       -> 解析 PaymentRequired -> 并发 KYC + AP2
- *       -> 生成 PaymentPayload -> 二次 callTool（含 _meta）
+ *       -> 解析 PaymentRequired -> 并发 KYC(agentryId) + AP2(verify-batch)
+ *       -> 生成 PaymentPayload -> 二次 callTool（含 _meta + agentry/payer-id）
  *       -> 提取回执 -> 异步 recordTransaction
  *
  * @author kuangyp
- * @version 2026-04-02
+ * @version 2026-04-03
  */
 import { config } from "dotenv";
 import { z } from "zod";
@@ -173,6 +180,22 @@ const gatewayAccount = privateKeyToAccount(evmPrivateKey);
 const gatewayWalletAddress = gatewayAccount.address;
 
 /**
+ * 买方 Agentry ID（从环境变量读取）。
+ *
+ * v3.0 起，KYC 和 AP2 接口均使用 Agentry ID 而非钱包地址标识身份。
+ * UAFG 部署时需通过环境变量 AGENTRY_ID 指定买方身份。
+ * 同时在二次调用时注入 _meta["agentry/payer-id"]，供 Hub 做收款侧审计。
+ */
+const payerAgentryId = (() => {
+  const id = process.env.AGENTRY_ID;
+  if (!id) {
+    console.error("❌ 缺少环境变量 AGENTRY_ID，无法标识买方身份");
+    process.exit(1);
+  }
+  return id;
+})();
+
+/**
  * 模块级 x402 支付客户端（独立于 MCP，专门负责生成支付签名）。
  *
  * 内部注册了 ExactEvmScheme，调用 createPaymentPayload 时自动完成：
@@ -280,42 +303,45 @@ function isValidEvmAddress(value: string): value is `0x${string}` {
 /**
  * 从 paymentRequired.accepts[0].extra 中提取 CartMandate。
  *
- * 下游服务器将 CartMandate 对象嵌套放在 extra.cartMandate 字段中，
- * 保留 extra 顶层的 name/version（EIP-712 domain 参数）不受干扰：
- *   extra = { name: "USDC", version: "2", cartMandate: { merchant_id, ... } }
+ * v3.0 变更：
+ * - CartMandate 从含 merchant_signature 的扁平结构改为含 vcJson 的完整结构。
+ * - 必填字段从 merchant_id + merchant_address + merchant_signature 改为 merchant_id + vcJson。
+ * - vcJson 是 Dashboard /api/mandates/cart/create 签发的 W3C VC（AP2CartMandate 类型）。
+ *
+ * 下游 MCP Hub 将 /api/mandates/cart/create 的完整响应放入 extra.cartMandate：
+ *   extra = { name: "USDC", version: "2", cartMandate: { mandateId, merchant_id, vcJson, ... } }
  *
  * 提取策略：
  * 1) 优先尝试 extra.cartMandate（嵌套格式，下游标准格式）
  * 2) 回退到 extra 顶层字段（兼容直接平铺格式）
  *
- * 若最终找不到三个必填字段（merchant_id / merchant_address / merchant_signature），
- * 则说明本次不是 AP2 场景，返回 null 跳过 AP2 校验（向后兼容非 AP2 下游）。
+ * 若找不到 merchant_id 和 vcJson，视为非 AP2 场景，返回 null 跳过 AP2 校验。
  */
 function extractCartMandate(extra: unknown): CartMandate | null {
   if (!extra || typeof extra !== "object") return null;
   const obj = extra as Record<string, unknown>;
 
-  // 优先从嵌套的 cartMandate 字段提取（下游标准输出格式）
   const nested = obj.cartMandate;
   const source: Record<string, unknown> =
     nested && typeof nested === "object" ? (nested as Record<string, unknown>) : obj;
 
-  // 三个必填字段不完整时视为非 AP2 支付，跳过校验
+  // v3.0: 必填字段改为 merchant_id 和 vcJson（W3C VC）
   if (
     typeof source.merchant_id !== "string" ||
-    typeof source.merchant_address !== "string" ||
-    typeof source.merchant_signature !== "string"
+    !source.vcJson || typeof source.vcJson !== "object"
   ) {
     return null;
   }
 
   return {
+    mandateId: typeof source.mandateId === "string" ? source.mandateId : "",
     merchant_id: source.merchant_id,
-    merchant_address: source.merchant_address,
+    merchant_address: typeof source.merchant_address === "string" ? source.merchant_address : undefined,
     total_amount: typeof source.total_amount === "string" ? source.total_amount : String(source.total_amount ?? "0"),
-    currency: typeof source.currency === "string" ? source.currency : undefined,
+    currency: typeof source.currency === "string" ? source.currency : "USDC",
     pay_to: typeof source.pay_to === "string" ? source.pay_to : undefined,
-    merchant_signature: source.merchant_signature,
+    vcJson: source.vcJson as Record<string, unknown>,
+    expiresAt: typeof source.expiresAt === "string" ? source.expiresAt : "",
   };
 }
 
@@ -458,7 +484,7 @@ async function callToolWithPaymentHandling(
   // 合规配置缺失时直接拒绝（fail-close）
   if (!complianceConfig) {
     const decision: ComplianceDecision = {
-      serviceId, toolName, counterparty, passed: false,
+      serviceId, toolName, counterparty: "unknown", passed: false,
       reasonCode: "COMPLIANCE_CONFIG_MISSING",
       message: "Compliance configuration is missing.",
       checkedAt: new Date().toISOString(),
@@ -466,23 +492,35 @@ async function callToolWithPaymentHandling(
     throw new PaymentRejectedError("compliance_check", decision, null, paymentCtx);
   }
 
-  // KYC 和 AP2 并发调度
-  const compliancePromise = runComplianceChecks(complianceConfig, serviceId, toolName, counterparty);
-
+  // v3.0: KYC 和 AP2 均依赖 CartMandate 中的 Agentry ID 和 vcJson
+  let compliancePromise: Promise<ComplianceDecision>;
   let assurancePromise: Promise<AssuranceResult | null>;
-  if (cartMandate && assuranceConfig) {
-    assurancePromise = runAssuranceCheck(assuranceConfig, gatewayWalletAddress, cartMandate);
-  } else if (cartMandate && !assuranceConfig) {
-    // 含 CartMandate 但缺少 AP2 配置，fail-close 拒绝
-    const failResult: AssuranceResult = {
-      passed: false,
-      errorCode: "CART_MANDATE_MISSING",
-      errorMessage: "Assurance configuration is missing but CartMandate is present.",
-      checkedAt: new Date().toISOString(),
-    };
-    assurancePromise = Promise.resolve(failResult);
+
+  if (cartMandate) {
+    // Agentry 生态内：KYC 用 merchant_id 作为 agentryId，AP2 用 verify-batch
+    compliancePromise = runComplianceChecks(complianceConfig, serviceId, toolName, cartMandate.merchant_id);
+
+    if (assuranceConfig) {
+      assurancePromise = runAssuranceCheck(assuranceConfig, payerAgentryId, cartMandate);
+    } else {
+      // 含 CartMandate 但缺少 AP2 配置，fail-close 拒绝
+      const failResult: AssuranceResult = {
+        passed: false,
+        errorCode: "CART_MANDATE_MISSING",
+        errorMessage: "Assurance configuration is missing but CartMandate is present.",
+        checkedAt: new Date().toISOString(),
+      };
+      assurancePromise = Promise.resolve(failResult);
+    }
   } else {
-    // 非 AP2 场景（无 CartMandate），跳过 AP2 校验
+    // 非 Agentry 生态（无 CartMandate）：无法获取 agentryId，跳过 KYC 和 AP2
+    console.error(`⚠️ 无 CartMandate，跳过 KYC 和 AP2 校验（非 Agentry 生态服务）`);
+    compliancePromise = Promise.resolve<ComplianceDecision>({
+      serviceId, toolName, counterparty: "unknown", passed: true,
+      reasonCode: "COMPLIANCE_PASSED",
+      message: "KYC skipped: non-Agentry service (no CartMandate).",
+      checkedAt: new Date().toISOString(),
+    });
     assurancePromise = Promise.resolve(null);
   }
 
@@ -514,11 +552,14 @@ async function callToolWithPaymentHandling(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const paymentPayload = await paymentClient.createPaymentPayload(paymentRequired as any);
 
-  // ── Step 6: 二次调用（携带支付签名） ──────────────────────────────
+  // ── Step 6: 二次调用（携带支付签名 + 买方 Agentry ID） ─────────────
   const paidResult = await client.callTool({
     name: toolName,
     arguments: args,
-    _meta: { [MCP_PAYMENT_META_KEY]: paymentPayload },
+    _meta: {
+      [MCP_PAYMENT_META_KEY]: paymentPayload,
+      "agentry/payer-id": payerAgentryId,
+    },
   }) as McpCallToolResult;
 
   // ── Step 7: 提取支付回执 ──────────────────────────────────────────
@@ -749,6 +790,7 @@ function registerGatewayTools(mcpServer: McpServer, registry: DownstreamServiceR
             payerCompliance: result.complianceDecision,
             payeeCompliance,
             intentMandateId: result.assuranceResult?.mandateId ?? "",
+            traceId,
           }));
         }
 
@@ -796,6 +838,7 @@ function registerGatewayTools(mcpServer: McpServer, registry: DownstreamServiceR
               payerCompliance: error.complianceDecision,
               payeeCompliance: null,
               intentMandateId: "",
+              traceId,
             }));
           }
 
@@ -848,6 +891,7 @@ function registerGatewayTools(mcpServer: McpServer, registry: DownstreamServiceR
             payerCompliance: null,
             payeeCompliance: null,
             intentMandateId: "",
+            traceId,
           }));
         }
 

@@ -7,9 +7,10 @@
  * 3) 采用 fire-and-forget 模式，不阻塞主链路响应。
  *
  * v2.0 变更：移除 KYT 相关字段（payerKytResult/payeeKytResult/payerKytRiskLevel/payeeKytRiskLevel）。
+ * v3.0 变更：新增 paymentMethod、currency、paymentDetail、metadata 字段，支持组件化支付方式。
  *
  * @author kuangyp
- * @version 2026-04-02
+ * @version 2026-04-03
  */
 
 import type { ComplianceDecision, PayeeComplianceDecision } from "./compliance.js";
@@ -82,6 +83,14 @@ export interface TransactionRecordPayload {
   payee?: string;
   payerKycResult?: number;
   payeeKycResult?: number;
+  /** 支付方式（如 "x402"、"onchain"、"fiat"），v3.0 新增 */
+  paymentMethod?: string;
+  /** 货币单位（如 "USDC"、"USD"），v3.0 新增 */
+  currency?: string;
+  /** 支付详情（任意 JSON 对象，如 { protocol: "x402" }），v3.0 新增 */
+  paymentDetail?: Record<string, unknown>;
+  /** 扩展信息（任意 JSON 对象，如 { traceId: "trace_xxx" }），v3.0 新增 */
+  metadata?: Record<string, unknown>;
   createdAt?: string;  // 客户端生成的中国时区时间戳，精确到秒
 }
 
@@ -146,9 +155,11 @@ export function buildTransactionPayload(
     payeeCompliance: PayeeComplianceDecision | null;
     /** AP2 Intent Mandate ID，校验通过时由 AssuranceResult.mandateId 提供 */
     intentMandateId: string;
+    /** 本次调用的追踪 ID，v3.0 新增 */
+    traceId?: string;
   },
 ): TransactionRecordPayload {
-  const { toolName, serviceResult, paymentCtx, paymentResponseData, payerCompliance, payeeCompliance, intentMandateId } = params;
+  const { toolName, serviceResult, paymentCtx, paymentResponseData, payerCompliance, payeeCompliance, intentMandateId, traceId } = params;
 
   return {
     serviceName: toolName,
@@ -165,6 +176,11 @@ export function buildTransactionPayload(
     payerKycResult: mapKycToNumber(payeeCompliance?.kycCompleted, payeeCompliance?.kycStatus),
     // 付款方对收款方的 KYC 结果（payer 视角检查 payee）
     payeeKycResult: mapKycToNumber(payerCompliance?.kycCompleted, payerCompliance?.kycStatus as string | null | undefined),
+    // v3.0 新增：支付方式与扩展信息
+    paymentMethod: "x402",
+    currency: paymentCtx?.tokenSymbol ?? "USDC",
+    paymentDetail: { protocol: "x402" },
+    metadata: traceId ? { traceId } : undefined,
     createdAt: toChinaTimeString(),
   };
 }
